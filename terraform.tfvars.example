@@ -1,0 +1,80 @@
+###############################################################################
+# 必須: アカウント / ネットワーク
+###############################################################################
+
+aws_region = "ap-northeast-1"
+
+# 使用するプロファイル (環境変数 AWS_PROFILE を使うなら削除)
+# aws_profile = "my-sandbox"
+
+# クロスアカウントで実行する場合
+# assume_role_arn         = "arn:aws:iam::123456789012:role/TerraformExecution"
+# assume_role_external_id = "xxxxxxxx"
+
+# 誤爆防止 (強く推奨)
+# allowed_account_ids = ["123456789012"]
+
+vpc_id     = "vpc-xxxxxxxxxxxxxxxxx"
+subnet_ids = ["subnet-xxxxxxxxxxxxxxxxx", "subnet-yyyyyyyyyyyyyyyyy"]
+
+# プライベートサブネットなので false のまま。
+# NAT Gateway が無い VPC の場合は ecr.api / ecr.dkr / logs / s3(Gateway) の
+# VPC エンドポイントが必要です。
+assign_public_ip = false
+
+# 既存 SG を使う場合。空なら「アウトバウンド全許可」の SG を自動作成します。
+# security_group_ids = ["sg-xxxxxxxxxxxxxxxxx"]
+
+###############################################################################
+# ヘルスチェック検証用パラメータ
+###############################################################################
+
+# 早く結果を見たいときは間隔と startPeriod を詰める
+sidecar_health_check_interval     = 10
+sidecar_health_check_timeout      = 5
+sidecar_health_check_retries      = 2
+sidecar_health_check_start_period = 10
+
+# --- healthCheck.command の候補 -------------------------------------------
+# (A) 既定値: amazon-cloudwatch-agent-ctl の status を判定
+# sidecar_health_check_command = [
+#   "CMD-SHELL",
+#   "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -m ec2 -a status | grep -q '\"status\": *\"running\"' || exit 1"
+# ]
+#
+# (B) エージェントのプロセス存在を pgrep で確認 (procps がある場合)
+# sidecar_health_check_command = [
+#   "CMD-SHELL",
+#   "pgrep -f amazon-cloudwatch-agent >/dev/null || exit 1"
+# ]
+#
+# (C) 設定ファイルが展開済みかを確認する軽量版 (依存コマンドがほぼ無い)
+# sidecar_health_check_command = [
+#   "CMD-SHELL",
+#   "test -s /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || exit 1"
+# ]
+#
+# (D) 常に成功 / 常に失敗 (ECS 側の挙動だけを見たいとき)
+# sidecar_health_check_command = ["CMD-SHELL", "exit 0"]
+
+# --- 異常系シナリオ ---------------------------------------------------------
+# true にすると command を強制的に `exit 1` に差し替えて UNHEALTHY を再現
+simulate_unhealthy = false
+
+# true : サイドカーが UNHEALTHY → タスクごと停止して再起動
+# false: サイドカーだけ停止し、アプリコンテナは動き続ける
+sidecar_essential = true
+
+# true : アプリコンテナはサイドカーが HEALTHY になるまで起動しない
+app_depends_on_sidecar_healthy = true
+
+###############################################################################
+# その他
+###############################################################################
+
+name_prefix           = "cwagent-sidecar-test"
+log_retention_in_days = 1
+desired_count         = 1
+
+# ECS Exec (コンテナに入ってヘルスチェックコマンドを直接検証できる)
+enable_execute_command = true
