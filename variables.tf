@@ -89,31 +89,25 @@ variable "log_retention_in_days" {
 }
 
 ###############################################################################
-# タスク定義
+# タスク定義 (共通)
 ###############################################################################
 
 variable "task_cpu" {
-  description = "タスク全体の CPU ユニット (Fargate)"
+  description = "タスク全体の CPU ユニット (Fargate)。サイドカー 2 本 + アプリで既定 512"
   type        = number
-  default     = 256
+  default     = 512
 }
 
 variable "task_memory" {
-  description = "タスク全体のメモリ MiB (Fargate)"
+  description = "タスク全体のメモリ MiB (Fargate)。サイドカー 2 本 + アプリで既定 1024"
   type        = number
-  default     = 512
+  default     = 1024
 }
 
 variable "desired_count" {
   description = "ECS サービスの希望タスク数"
   type        = number
   default     = 1
-}
-
-variable "cwagent_image" {
-  description = "CloudWatch Agent サイドカーのイメージ"
-  type        = string
-  default     = "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest"
 }
 
 variable "app_image" {
@@ -128,11 +122,35 @@ variable "enable_execute_command" {
   default     = true
 }
 
+variable "app_depends_on_sidecar_healthy" {
+  description = "アプリコンテナを dependsOn condition=HEALTHY で、有効化した全サイドカーの healthy 待ちにするか"
+  type        = bool
+  default     = true
+}
+
+variable "additional_task_policy_arns" {
+  description = "タスクロールに追加でアタッチする IAM ポリシー ARN (例: X-Ray を使う場合の AWSXrayWriteOnlyAccess)"
+  type        = list(string)
+  default     = []
+}
+
 ###############################################################################
-# ヘルスチェック (今回の検証対象)
+# サイドカー 1: CloudWatch Agent (検証対象)
 ###############################################################################
 
-variable "sidecar_health_check_command" {
+variable "enable_cwagent_sidecar" {
+  description = "CloudWatch Agent サイドカーを起動するか。false にすると ADOT だけを単独で検証できる"
+  type        = bool
+  default     = true
+}
+
+variable "cwagent_image" {
+  description = "CloudWatch Agent サイドカーのイメージ"
+  type        = string
+  default     = "public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest"
+}
+
+variable "cwagent_health_check_command" {
   description = <<-EOT
     CloudWatch Agent サイドカーの healthCheck.command。
     既定は amazon-cloudwatch-agent-ctl の status 出力を判定する方式。
@@ -146,51 +164,127 @@ variable "sidecar_health_check_command" {
   ]
 }
 
-variable "sidecar_health_check_interval" {
-  description = "healthCheck.interval (秒)"
+variable "cwagent_health_check_interval" {
+  description = "CloudWatch Agent の healthCheck.interval (秒)"
   type        = number
   default     = 30
 }
 
-variable "sidecar_health_check_timeout" {
-  description = "healthCheck.timeout (秒)"
+variable "cwagent_health_check_timeout" {
+  description = "CloudWatch Agent の healthCheck.timeout (秒)"
   type        = number
   default     = 5
 }
 
-variable "sidecar_health_check_retries" {
-  description = "healthCheck.retries (UNHEALTHY と判定するまでの連続失敗回数)"
+variable "cwagent_health_check_retries" {
+  description = "CloudWatch Agent の healthCheck.retries (UNHEALTHY と判定するまでの連続失敗回数)"
   type        = number
   default     = 3
 }
 
-variable "sidecar_health_check_start_period" {
-  description = "healthCheck.startPeriod (秒)。この間の失敗は retries にカウントされない"
+variable "cwagent_health_check_start_period" {
+  description = "CloudWatch Agent の healthCheck.startPeriod (秒)。この間の失敗は retries にカウントされない"
   type        = number
   default     = 30
 }
 
-variable "sidecar_essential" {
+variable "cwagent_essential" {
   description = <<-EOT
-    サイドカーを essential にするか。
-    true  : サイドカーが UNHEALTHY で停止するとタスク全体が停止し、サービスが再起動する
-    false : サイドカーだけが停止し、アプリコンテナはそのまま動き続ける
+    CloudWatch Agent サイドカーを essential にするか。
+    true  : UNHEALTHY で停止するとタスク全体が停止し、サービスが再起動する
+    false : このサイドカーだけが停止し、他のコンテナはそのまま動き続ける
   EOT
   type        = bool
   default     = true
 }
 
-variable "app_depends_on_sidecar_healthy" {
-  description = "アプリコンテナを dependsOn condition=HEALTHY でサイドカーの healthy 待ちにするか"
+variable "cwagent_simulate_unhealthy" {
+  description = <<-EOT
+    true にすると CloudWatch Agent の healthCheck.command を `exit 1` に差し替え、
+    UNHEALTHY 時の挙動 (essential / dependsOn の効き方) を強制的に再現する。
+    var.cwagent_health_check_command より優先される。
+  EOT
+  type        = bool
+  default     = false
+}
+
+###############################################################################
+# サイドカー 2: ADOT Collector (検証対象)
+###############################################################################
+
+variable "enable_adot_sidecar" {
+  description = "ADOT (AWS Distro for OpenTelemetry) Collector サイドカーを起動するか"
   type        = bool
   default     = true
 }
 
-variable "simulate_unhealthy" {
+variable "adot_image" {
+  description = "ADOT Collector サイドカーのイメージ"
+  type        = string
+  default     = "public.ecr.aws/aws-observability/aws-otel-collector:latest"
+}
+
+variable "adot_config" {
   description = <<-EOT
-    true にすると healthCheck.command を `exit 1` に差し替え、
+    ADOT Collector の設定 (YAML 文字列)。AOT_CONFIG_CONTENT 環境変数で渡される。
+    null の場合は health_check extension を有効にした既定設定を使う。
+    健全性の判定は health_check extension (13133/tcp) が担うため、
+    独自設定に差し替える場合も extensions に health_check を残すこと。
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "adot_health_check_command" {
+  description = <<-EOT
+    ADOT Collector サイドカーの healthCheck.command。
+    既定はイメージに同梱される /healthcheck バイナリ (health_check extension を叩く)。
+    aws-otel-collector イメージにはシェルや curl/wget が無いため、
+    CMD-SHELL 形式は使えない点に注意。
+  EOT
+  type        = list(string)
+  default     = ["CMD", "/healthcheck"]
+}
+
+variable "adot_health_check_interval" {
+  description = "ADOT Collector の healthCheck.interval (秒)"
+  type        = number
+  default     = 30
+}
+
+variable "adot_health_check_timeout" {
+  description = "ADOT Collector の healthCheck.timeout (秒)"
+  type        = number
+  default     = 5
+}
+
+variable "adot_health_check_retries" {
+  description = "ADOT Collector の healthCheck.retries (UNHEALTHY と判定するまでの連続失敗回数)"
+  type        = number
+  default     = 3
+}
+
+variable "adot_health_check_start_period" {
+  description = "ADOT Collector の healthCheck.startPeriod (秒)。この間の失敗は retries にカウントされない"
+  type        = number
+  default     = 30
+}
+
+variable "adot_essential" {
+  description = <<-EOT
+    ADOT Collector サイドカーを essential にするか。
+    true  : UNHEALTHY で停止するとタスク全体が停止し、サービスが再起動する
+    false : このサイドカーだけが停止し、他のコンテナはそのまま動き続ける
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "adot_simulate_unhealthy" {
+  description = <<-EOT
+    true にすると ADOT Collector の healthCheck.command を `exit 1` に差し替え、
     UNHEALTHY 時の挙動 (essential / dependsOn の効き方) を強制的に再現する。
-    var.sidecar_health_check_command より優先される。
+    var.adot_health_check_command より優先される。
   EOT
   type        = bool
   default     = false

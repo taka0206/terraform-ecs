@@ -10,8 +10,8 @@ locals {
   app_log_dir    = "/var/log/app"
   app_log_file   = "/var/log/app/app.log"
 
-  # 検証用: simulate_unhealthy = true なら必ず失敗するコマンドに差し替える
-  health_check_command = var.simulate_unhealthy ? ["CMD-SHELL", "exit 1"] : var.sidecar_health_check_command
+  cwagent_container_name = "cloudwatch-agent"
+  adot_container_name    = "adot-collector"
 
   # splat を使うことで count = 0 のときも安全に空リストになる
   security_group_ids = length(var.security_group_ids) > 0 ? var.security_group_ids : aws_security_group.task[*].id
@@ -19,7 +19,31 @@ locals {
   # ダミーアプリ: 5 秒ごとに共有ボリューム上のファイルへ 1 行書き足すだけ
   app_command = "mkdir -p ${local.app_log_dir}; i=0; while true; do i=$((i+1)); line=\"$(date -u '+%Y-%m-%dT%H:%M:%SZ') app log line $i\"; echo \"$line\" >> ${local.app_log_file}; echo \"$line\"; sleep 5; done"
 
-  # CloudWatch Agent の設定は CW_CONFIG_CONTENT 環境変数で丸ごと渡す
+  #############################################################################
+  # ヘルスチェックコマンド
+  #
+  # simulate_unhealthy = true のときは必ず失敗するコマンドに差し替える。
+  # CloudWatch Agent はシェルがあるので `exit 1`、
+  # ADOT はシェルを持たないイメージなので「存在しないパスの exec 失敗」で落とす。
+  #############################################################################
+  cwagent_health_check_command = (
+    var.cwagent_simulate_unhealthy
+    ? ["CMD-SHELL", "exit 1"]
+    : var.cwagent_health_check_command
+  )
+
+  adot_health_check_command = (
+    var.adot_simulate_unhealthy
+    ? ["CMD", "/nonexistent-force-unhealthy"]
+    : var.adot_health_check_command
+  )
+
+  #############################################################################
+  # サイドカー 1: CloudWatch Agent
+  #
+  # 設定は CW_CONFIG_CONTENT 環境変数で丸ごと渡す。
+  # 共有ボリューム上のアプリログを tail して CloudWatch Logs へ転送する。
+  #############################################################################
   cwagent_config = jsonencode({
     logs = {
       force_flush_interval = 5
@@ -38,13 +62,10 @@ locals {
     }
   })
 
-  #############################################################################
-  # 検証対象: CloudWatch Agent サイドカー
-  #############################################################################
   container_cwagent = {
-    name      = "cloudwatch-agent"
+    name      = local.cwagent_container_name
     image     = var.cwagent_image
-    essential = var.sidecar_essential
+    essential = var.cwagent_essential
 
     environment = [
       {
@@ -65,13 +86,13 @@ locals {
       }
     ]
 
-    # ---- ここが今回の検証ポイント ----
+    # ---- 検証ポイント ----
     healthCheck = {
-      command     = local.health_check_command
-      interval    = var.sidecar_health_check_interval
-      timeout     = var.sidecar_health_check_timeout
-      retries     = var.sidecar_health_check_retries
-      startPeriod = var.sidecar_health_check_start_period
+      command     = local.cwagent_health_check_command
+      interval    = var.cwagent_health_check_interval
+      timeout     = var.cwagent_health_check_timeout
+      retries     = var.cwagent_health_check_retries
+      startPeriod = var.cwagent_health_check_start_period
     }
 
     logConfiguration = {
@@ -85,9 +106,91 @@ locals {
   }
 
   #############################################################################
+  # サイドカー 2: ADOT Collector
+  #
+  # 設定は AOT_CONFIG_CONTENT 環境変数で丸ごと渡す。
+  # 既定設定は health_check extension (13133/tcp) を有効にし、
+  # OTLP で受けたログを CloudWatch Logs へ流すだけの最小パイプライン。
+  # 送信元が無くてもコレクタは正常起動し、healthCheck は成功する。
+  #############################################################################
+  adot_default_config = yamlencode({
+    extensions = {
+      health_check = {
+        endpoint = "0.0.0.0:13133"
+      }
+    }
+    receivers = {
+      otlp = {
+        protocols = {
+          grpc = { endpoint = "0.0.0.0:4317" }
+          http = { endpoint = "0.0.0.0:4318" }
+        }
+      }
+    }
+    processors = {
+      batch = {}
+    }
+    exporters = {
+      awscloudwatchlogs = {
+        region          = var.aws_region
+        log_group_name  = aws_cloudwatch_log_group.this.name
+        log_stream_name = "adot"
+      }
+    }
+    service = {
+      extensions = ["health_check"]
+      pipelines = {
+        logs = {
+          receivers  = ["otlp"]
+          processors = ["batch"]
+          exporters  = ["awscloudwatchlogs"]
+        }
+      }
+    }
+  })
+
+  adot_config = var.adot_config != null ? var.adot_config : local.adot_default_config
+
+  container_adot = {
+    name      = local.adot_container_name
+    image     = var.adot_image
+    essential = var.adot_essential
+
+    environment = [
+      {
+        name  = "AOT_CONFIG_CONTENT"
+        value = local.adot_config
+      },
+    ]
+
+    # ---- 検証ポイント ----
+    healthCheck = {
+      command     = local.adot_health_check_command
+      interval    = var.adot_health_check_interval
+      timeout     = var.adot_health_check_timeout
+      retries     = var.adot_health_check_retries
+      startPeriod = var.adot_health_check_start_period
+    }
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"         = aws_cloudwatch_log_group.this.name
+        "awslogs-region"        = var.aws_region
+        "awslogs-stream-prefix" = "adot"
+      }
+    }
+  }
+
+  #############################################################################
   # ダミーアプリ: 共有ボリュームにログを書き続けるだけ
   #############################################################################
-  # dependsOn は不要なときにキーごと落とす (空配列を API に送らない)
+  # 有効化したサイドカーすべての HEALTHY を待つ
+  app_depends_on = var.app_depends_on_sidecar_healthy ? concat(
+    var.enable_cwagent_sidecar ? [{ containerName = local.cwagent_container_name, condition = "HEALTHY" }] : [],
+    var.enable_adot_sidecar ? [{ containerName = local.adot_container_name, condition = "HEALTHY" }] : [],
+  ) : []
+
   container_app = merge(
     {
       name      = "app"
@@ -112,15 +215,17 @@ locals {
         }
       }
     },
-    # サイドカーが HEALTHY になるまでアプリの起動を待たせる
-    var.app_depends_on_sidecar_healthy ? {
-      dependsOn = [
-        {
-          containerName = "cloudwatch-agent"
-          condition     = "HEALTHY"
-        }
-      ]
-    } : {},
+    # dependsOn は不要なときにキーごと落とす (空配列を API に送らない)
+    length(local.app_depends_on) > 0 ? { dependsOn = local.app_depends_on } : {},
+  )
+
+  #############################################################################
+  # タスク定義に載せるコンテナ一覧
+  #############################################################################
+  containers = concat(
+    var.enable_cwagent_sidecar ? [local.container_cwagent] : [],
+    var.enable_adot_sidecar ? [local.container_adot] : [],
+    [local.container_app],
   )
 }
 
@@ -180,15 +285,26 @@ resource "aws_iam_role_policy_attachment" "execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# タスクロール: CloudWatch Agent がログ/メトリクスを送るために使う
+# タスクロール: サイドカーが AWS API を叩くために使う
 resource "aws_iam_role" "task" {
   name               = "${local.name}-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
 }
 
+# CloudWatch Agent / ADOT Collector がログとメトリクスを送るために使う。
+# CloudWatchAgentServerPolicy に logs:CreateLogGroup / CreateLogStream /
+# PutLogEvents / DescribeLogStreams が含まれるので両サイドカーで共用できる。
 resource "aws_iam_role_policy_attachment" "task_cwagent" {
   role       = aws_iam_role.task.name
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# 追加ポリシー (例: ADOT で X-Ray を使う場合の AWSXrayWriteOnlyAccess)
+resource "aws_iam_role_policy_attachment" "task_additional" {
+  for_each = toset(var.additional_task_policy_arns)
+
+  role       = aws_iam_role.task.name
+  policy_arn = each.value
 }
 
 # ECS Exec (コンテナに入ってヘルスチェックコマンドを直接叩くため)
@@ -241,10 +357,7 @@ resource "aws_ecs_task_definition" "this" {
     name = local.app_log_volume
   }
 
-  container_definitions = jsonencode([
-    local.container_cwagent,
-    local.container_app,
-  ])
+  container_definitions = jsonencode(local.containers)
 }
 
 resource "aws_ecs_service" "this" {

@@ -26,55 +26,118 @@ assign_public_ip = false
 # security_group_ids = ["sg-xxxxxxxxxxxxxxxxx"]
 
 ###############################################################################
-# ヘルスチェック検証用パラメータ
+# サイドカー 1: CloudWatch Agent のヘルスチェック
 ###############################################################################
 
-# 早く結果を見たいときは間隔と startPeriod を詰める
-sidecar_health_check_interval     = 10
-sidecar_health_check_timeout      = 5
-sidecar_health_check_retries      = 2
-sidecar_health_check_start_period = 10
+enable_cwagent_sidecar = true
 
-# --- healthCheck.command の候補 -------------------------------------------
+# 早く結果を見たいときは間隔と startPeriod を詰める
+cwagent_health_check_interval     = 10
+cwagent_health_check_timeout      = 5
+cwagent_health_check_retries      = 2
+cwagent_health_check_start_period = 10
+
+# --- cwagent_health_check_command の候補 -----------------------------------
 # (A) 既定値: amazon-cloudwatch-agent-ctl の status を判定
-# sidecar_health_check_command = [
+# cwagent_health_check_command = [
 #   "CMD-SHELL",
 #   "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -m ec2 -a status | grep -q '\"status\": *\"running\"' || exit 1"
 # ]
 #
 # (B) エージェントのプロセス存在を pgrep で確認 (procps がある場合)
-# sidecar_health_check_command = [
+# cwagent_health_check_command = [
 #   "CMD-SHELL",
 #   "pgrep -f amazon-cloudwatch-agent >/dev/null || exit 1"
 # ]
 #
 # (C) 設定ファイルが展開済みかを確認する軽量版 (依存コマンドがほぼ無い)
-# sidecar_health_check_command = [
+# cwagent_health_check_command = [
 #   "CMD-SHELL",
 #   "test -s /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || exit 1"
 # ]
 #
 # (D) 常に成功 / 常に失敗 (ECS 側の挙動だけを見たいとき)
-# sidecar_health_check_command = ["CMD-SHELL", "exit 0"]
+# cwagent_health_check_command = ["CMD-SHELL", "exit 0"]
 
-# --- 異常系シナリオ ---------------------------------------------------------
+# true : UNHEALTHY → タスクごと停止して再起動
+# false: このサイドカーだけ停止し、他のコンテナは動き続ける
+cwagent_essential = true
+
 # true にすると command を強制的に `exit 1` に差し替えて UNHEALTHY を再現
-simulate_unhealthy = false
+cwagent_simulate_unhealthy = false
 
-# true : サイドカーが UNHEALTHY → タスクごと停止して再起動
-# false: サイドカーだけ停止し、アプリコンテナは動き続ける
-sidecar_essential = true
+###############################################################################
+# サイドカー 2: ADOT Collector のヘルスチェック
+###############################################################################
 
-# true : アプリコンテナはサイドカーが HEALTHY になるまで起動しない
+enable_adot_sidecar = true
+
+adot_health_check_interval     = 10
+adot_health_check_timeout      = 5
+adot_health_check_retries      = 2
+adot_health_check_start_period = 10
+
+# --- adot_health_check_command の候補 --------------------------------------
+# (A) 既定値: イメージ同梱の /healthcheck バイナリ
+#     health_check extension (13133/tcp) を叩く。AWS 公式テンプレートと同じ形。
+# adot_health_check_command = ["CMD", "/healthcheck"]
+#
+# (B) 常に失敗させる (exec 失敗で UNHEALTHY)
+# adot_health_check_command = ["CMD", "/nonexistent-force-unhealthy"]
+#
+# 注意: aws-otel-collector イメージはシェルや curl/wget を持たないため、
+#       CMD-SHELL 形式 (例: "wget -O- http://localhost:13133") は使えません。
+#       ヘルスチェックは必ず CMD 形式でイメージ内のバイナリを直接指定します。
+
+adot_essential = true
+
+# true にすると command を存在しないパスに差し替えて UNHEALTHY を再現
+adot_simulate_unhealthy = false
+
+# ADOT の設定を差し替える場合 (null なら health_check extension 有効の既定設定)
+# extensions に health_check を残さないと /healthcheck が失敗する点に注意。
+# adot_config = <<-EOT
+#   extensions:
+#     health_check:
+#       endpoint: 0.0.0.0:13133
+#   receivers:
+#     otlp:
+#       protocols:
+#         grpc:
+#           endpoint: 0.0.0.0:4317
+#   processors:
+#     batch: {}
+#   exporters:
+#     awscloudwatchlogs:
+#       region: ap-northeast-1
+#       log_group_name: /ecs/cwagent-sidecar-test
+#       log_stream_name: adot
+#   service:
+#     extensions: [health_check]
+#     pipelines:
+#       logs:
+#         receivers: [otlp]
+#         processors: [batch]
+#         exporters: [awscloudwatchlogs]
+# EOT
+
+###############################################################################
+# 共通
+###############################################################################
+
+# true : 有効化した全サイドカーが HEALTHY になるまで app を起動しない
 app_depends_on_sidecar_healthy = true
-
-###############################################################################
-# その他
-###############################################################################
 
 name_prefix           = "cwagent-sidecar-test"
 log_retention_in_days = 1
 desired_count         = 1
 
-# ECS Exec (コンテナに入ってヘルスチェックコマンドを直接検証できる)
+# サイドカー 2 本 + アプリなので既定は 512 / 1024
+task_cpu    = 512
+task_memory = 1024
+
+# ECS Exec (CloudWatch Agent に入ってヘルスチェックコマンドを直接検証できる)
 enable_execute_command = true
+
+# ADOT で X-Ray も使う場合など
+# additional_task_policy_arns = ["arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"]
